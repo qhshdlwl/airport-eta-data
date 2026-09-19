@@ -1,0 +1,21 @@
+# 진단용(수동 실행 전용): GitHub 러너에서 공공데이터포털에 닿는지 확인한다. 키를 쓰지 않는다.
+name: diag
+on: { workflow_dispatch: {} }
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: 러너 위치
+        run: curl -s --max-time 10 https://ipinfo.io/json | grep -E '"(ip|city|country|org)"' || true
+      - name: apis.data.go.kr (잘못된 키 — 닿으면 403 JSON 이 와야 한다)
+        run: |
+          for u in "https://apis.data.go.kr/B551178/airport-process-time/v1?serviceKey=BADKEY&type=json" \
+                   "https://apis.data.go.kr/B551177/passgrAnncmt/getPassgrAnncmt?serviceKey=BADKEY&type=json" \
+                   "https://www.data.go.kr/" "https://api.odcloud.kr/api/ApplyhomeInfoDetailSvc/v1/getAPTLttotPblancDetail?serviceKey=BADKEY"; do
+            echo "== $u"
+            curl -4 -s -o /tmp/o.txt -w 'http=%{http_code} connect=%{time_connect}s tls=%{time_appconnect}s total=%{time_total}s ip=%{remote_ip}\n' --max-time 20 "$u" || echo "curl exit=$?"
+            head -c 160 /tmp/o.txt; echo
+          done
+      - name: DNS
+        run: getent hosts apis.data.go.kr || true
