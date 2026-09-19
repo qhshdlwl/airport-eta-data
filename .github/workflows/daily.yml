@@ -1,0 +1,31 @@
+# 하루 1회(04:10 KST): 운항 스케줄(편명 조회용) + 최근 28일 요일별 승객 프로파일 → daily.json
+# 정본은 이 파일, 실제로 도는 사본은 qhshdlwl/airport-eta-data 의 .github/workflows/daily.yml. 고치면 양쪽 같이.
+# 호출 수 약 250회 · 1분 남짓. 초당 호출 제한이 있어 스크립트가 220ms 간격으로 줄을 세운다.
+name: daily
+on:
+  schedule:
+    - cron: "10 19 * * *" # 04:10 KST
+  workflow_dispatch:
+concurrency: data-writer
+permissions:
+  contents: write
+jobs:
+  daily:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: 배치(daily)
+        run: node scripts/fetch-airport.mjs daily
+        env:
+          DATA_GO_KR_KEY: ${{ secrets.DATA_GO_KR_KEY }}
+          OUT_DIR: ${{ github.workspace }}
+      - name: 올리기
+        run: |
+          git config user.name "airport-eta-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add daily.json
+          git diff --cached --quiet || { git commit -q -m "data: $(TZ=Asia/Seoul date '+%F') daily" && git pull -q --rebase && git push -q; }

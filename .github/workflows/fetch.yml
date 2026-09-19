@@ -1,12 +1,14 @@
-# 30분마다 공항 데이터를 갱신한다.
-# 정본은 앱 레포의 apps/airport-eta/ops/fetch.yml — 고치면 양쪽을 같이 고친다.
-# 필요한 시크릿: DATA_GO_KR_KEY (공공데이터포털 일반 인증키 Decoding)
+# 30분마다: 실측 소요시간·혼잡도, 승객 예고(오늘·내일), 인천 출국장 대기, 주차 → status.json
+# 이 파일이 정본이고, 실제로 도는 사본은 공개 데이터 레포 qhshdlwl/airport-eta-data 의
+# .github/workflows/fetch.yml 이다 (공개 레포는 Actions 분이 무제한이라 거기서 돌린다).
+# 고치면 양쪽을 같이 고친다. 배치 스크립트도 마찬가지 — scripts/fetch-airport.mjs 가 정본.
+# 필요한 시크릿: DATA_GO_KR_KEY (공공데이터포털 일반 인증키)
 name: fetch
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "7,37 * * * *" # 정각·30분은 GitHub 스케줄러가 붐벼 밀린다
   workflow_dispatch:
-concurrency: airport-eta-fetch
+concurrency: data-writer # daily 와 같은 그룹 — 두 잡이 동시에 push 하지 않게
 permissions:
   contents: write
 jobs:
@@ -18,13 +20,15 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: 배치
-        run: node scripts/fetch-airport.mjs
+      - name: 배치(status)
+        run: node scripts/fetch-airport.mjs status
         env:
           DATA_GO_KR_KEY: ${{ secrets.DATA_GO_KR_KEY }}
+          OUT_DIR: ${{ github.workspace }}
+          LOG_HISTORY: "1"
       - name: 올리기
         run: |
           git config user.name "airport-eta-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add status.json
-          git diff --cached --quiet || { git commit -q -m "data: $(TZ=Asia/Seoul date '+%F %H:%M') 갱신" && git push -q; }
+          git add status.json history
+          git diff --cached --quiet || { git commit -q -m "data: $(TZ=Asia/Seoul date '+%F %H:%M') status" && git pull -q --rebase && git push -q; }
