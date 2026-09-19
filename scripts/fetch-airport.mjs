@@ -271,12 +271,20 @@ async function logHistory(live) {
   } catch (e) { note(`history 기록 실패: ${e.message}`); }
 }
 
+/** 인천 운항 현황 한 날치. searchday=YYYYMMDD 필터가 되고 numOfRows=2000 으로 하루(코드쉐어 포함 약 1,200행)가 한 번에 온다. */
+function icnDay(day) {
+  return fetchAll(`${IIA}/StatusOfPassengerFlightsDeOdp/getPassengerDeparturesDeOdp`, { searchday: day }, { pageSize: 2000, where: "icn-flight-status" });
+}
+const ICN_TERM = { P01: "T1", P02: "T1C", P03: "T2" }; // P02 = 탑승동(101~132번 게이트). 체크인은 T1 에서 한다.
+
 /**
- * 오늘 출발편의 지연·결항·게이트. 행 = [편명, 공항, 예정HHMM, 변경HHMM|null, 게이트|null, 상태, D|I, 터미널|null, 체크인카운터|null]
- * 인천(15112968)은 활용신청이 반영되면 붙는다 — 필드는 포털 명세 기준이며 첫 성공 시 확인할 것.
+ * 출발편 현황. 행 = [편명, 공항, 날짜ymd, 예정HHMM, 변경HHMM|null, 게이트|null, 상태|null, D|I, 터미널|null, 체크인카운터|null]
+ *  - 공항공사 5곳: 오늘만 준다(schDate 무시됨). 편명에 접미 문자가 붙기도 한다(ZE781A).
+ *  - 인천: 오늘·내일. 코드쉐어 편명(Slave)도 자기 행으로 들어 있어 탑승권의 편명 그대로 찾을 수 있다.
  */
 async function liveFlights() {
   const rows = [];
+  const today = ymd(kstDay(0));
   for (const ap of KAC_AIRPORTS) {
     const list = await attempt(`실시간 운항 ${ap}`, () =>
       fetchAll(`${KAC}/flight-status/info`, { schAirCode: ap, schIOType: "O" }, { where: "flight-status" }), null);
@@ -285,22 +293,23 @@ async function liveFlights() {
       const no = String(it.airFln ?? "").trim().toUpperCase();
       const std = hhmm(it.std);
       if (!no || !std) continue;
-      rows.push([no, ap, std, it.etd ? hhmm(it.etd) : null, it.gate ? String(it.gate).trim() : null,
+      rows.push([no, ap, today, std, it.etd ? hhmm(it.etd) : null, it.gate ? String(it.gate).trim() : null,
         String(it.rmkKor ?? "").trim() || null, it.line === "국제" ? "I" : "D", null, null]);
     }
   }
-  const today = ymd(kstDay(0));
-  const icn = await attempt("인천 실시간 운항", () =>
-    fetchAll(`${IIA}/StatusOfPassengerFlightsDeOdp/getPassengerDeparturesDeOdp`, {}, { where: "icn-flight-status" }), null);
-  for (const it of icn ?? []) {
-    const sch = String(it.scheduleDateTime ?? ""), est = String(it.estimatedDateTime ?? "");
-    if (sch.slice(0, 8) !== today) continue;
-    const term = { P01: "T1", P02: "T1C", P03: "T2" }[it.terminalid] ?? null; // P02 = 탑승동
-    rows.push([String(it.flightId ?? "").trim().toUpperCase(), "ICN", sch.slice(8, 12), est.length >= 12 ? est.slice(8, 12) : null,
-      it.gatenumber ? String(it.gatenumber).trim() : null, String(it.remark ?? "").trim() || null,
-      it.typeOfFlight === "D" ? "D" : "I", term, it.chkinrange ? String(it.chkinrange).trim() : null]);
+  for (const off of [0, 1]) {
+    const day = ymd(kstDay(off));
+    const icn = await attempt(`인천 운항 현황 ${day}`, () => icnDay(day), null);
+    for (const it of icn ?? []) {
+      const sch = String(it.scheduleDateTime ?? ""), est = String(it.estimatedDateTime ?? "");
+      const no = String(it.flightId ?? "").trim().toUpperCase();
+      if (sch.slice(0, 8) !== day || !no) continue;
+      rows.push([no, "ICN", day, sch.slice(8, 12), est.length >= 12 && est !== sch ? est.slice(8, 12) : null,
+        it.gatenumber ? String(it.gatenumber).trim() : null, String(it.remark ?? "").trim() || null,
+        it.typeOfFlight === "D" ? "D" : "I", ICN_TERM[it.terminalid] ?? null, it.chkinrange ? String(it.chkinrange).trim() : null]);
+    }
   }
-  return rows.length ? { date: today, rows } : null;
+  return rows.length ? { rows } : null;
 }
 
 async function runStatus() {
@@ -323,11 +332,11 @@ async function runStatus() {
   await writeOut("status.json", out);
   // 운항 현황은 낡으면 해롭다 — 못 읽었으면 빈 목록으로 덮어 "정보 없음"이 되게 한다
   await writeOut("live.json", {
-    v: 2, updatedAt: out.updatedAt, date: flightsNow?.date ?? ymd(kstDay(0)),
-    cols: ["no", "ap", "std", "etd", "gate", "rmk", "line", "term", "chkin"], rows: flightsNow?.rows ?? []
+    v: 3, updatedAt: out.updatedAt,
+    cols: ["no", "ap", "day", "std", "etd", "gate", "rmk", "line", "term", "chkin"], rows: flightsNow?.rows ?? []
   });
   if (live && process.env.LOG_HISTORY === "1") await logHistory(live); // 데이터 레포에서만 켠다 — 앱 번들에 CSV 가 섞이면 안 된다
-  console.log(`status 저장: 운항 ${flightsNow?.rows.length ?? 0}편 · 실측 ${Object.keys(out.kac).length}곳 · 예보 ${Object.keys(out.forecast).length}곳 · 출국장실측 ${gates ? "있음" : "없음"} · 주차 ${Object.keys(out.parking).length}곳`);
+  console.log(`status 저장: 운항 ${flightsNow?.rows.length ?? 0}행 · 실측 ${Object.keys(out.kac).length}곳 · 예보 ${Object.keys(out.forecast).length}곳 · 출국장실측 ${gates ? "있음" : "없음"} · 주차 ${Object.keys(out.parking).length}곳`);
 }
 
 /* =================================================================== daily */
@@ -420,10 +429,37 @@ async function weekdayProfile() {
   return { profile, ref, days };
 }
 
+/**
+ * 인천은 스케줄에 터미널이 없다. 최근 운항 현황에서 "항공사 → 터미널"을 배워 며칠 뒤 비행기도 터미널을 미리 골라준다.
+ * 한 터미널 비중이 85% 이상인 항공사만 싣는다 — 애매하면 사용자가 고르게 둔다. 코드쉐어(Slave) 행은 운항사가 달라 제외.
+ */
+async function icnTerminals() {
+  const count = {};
+  for (const off of [-1, 0, 1]) {
+    const rows = await attempt(`인천 터미널 학습 ${ymd(kstDay(off))}`, () => icnDay(ymd(kstDay(off))), null);
+    for (const it of rows ?? []) {
+      const term = ICN_TERM[it.terminalid], airline = String(it.airline ?? "").trim();
+      if (!term || !airline || (it.codeshare && it.codeshare !== "Master")) continue;
+      (count[airline] ??= {})[term] = (count[airline][term] ?? 0) + 1;
+    }
+  }
+  const out = {};
+  for (const [airline, c] of Object.entries(count)) {
+    const t1 = c.T1 ?? 0, conc = c.T1C ?? 0, t2 = c.T2 ?? 0, total = t1 + conc + t2;
+    if (total < 2) continue;
+    if (t2 / total >= 0.85) out[airline] = "T2";
+    // T1 계열: 본관과 탑승동을 날마다 섞어 쓰는 항공사가 많다(LCC). 탑승동 비중이 30% 이상이면
+    // 탑승동으로 잡는다 — 게이트 이동이 13분 더 걸리는 쪽이 보수적이다. 체크인은 어차피 둘 다 T1 이다.
+    else if ((t1 + conc) / total >= 0.85) out[airline] = conc / (t1 + conc) >= 0.3 ? "T1C" : "T1";
+  }
+  return Object.keys(out).length ? out : null;
+}
+
 async function runDaily() {
   const prev = (await readPrev("daily.json")) ?? {};
   const list = await schedules();
   const prof = await weekdayProfile();
+  const terms = await icnTerminals();
   // 스케줄이 비정상적으로 줄었으면 덮지 않는다 (부분 실패로 편명이 사라지는 것을 막는다)
   const prevN = prev.flights?.length ?? 0;
   const keepPrev = prevN > 0 && list.length < Math.max(200, prevN * 0.6);
@@ -440,10 +476,11 @@ async function runDaily() {
     profile: prof?.profile ?? prev.profile ?? {},
     ref: prof?.ref ?? prev.ref ?? {},
     profileDays: prof?.days ?? prev.profileDays ?? 0,
+    icnTerminals: terms ?? prev.icnTerminals ?? {},
     problems: problems.length ? [...problems] : undefined
   };
   await writeOut("daily.json", out);
-  console.log(`daily 저장: 스케줄 ${out.flights.length}건 · 프로파일 ${Object.keys(out.profile).length}곳(${out.profileDays}일치)`);
+  console.log(`daily 저장: 스케줄 ${out.flights.length}건 · 프로파일 ${Object.keys(out.profile).length}곳(${out.profileDays}일치) · 인천 터미널 ${Object.keys(out.icnTerminals).length}개 항공사`);
 }
 
 /* ==================================================================== main */
