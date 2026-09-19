@@ -4,7 +4,7 @@
 //   node --env-file-if-exists=.env scripts/fetch-airport.mjs daily    # 하루 1회 — 운항 스케줄·요일 프로파일
 //   node --env-file-if-exists=.env scripts/fetch-airport.mjs all
 //
-// 산출물: $OUT_DIR/status.json, $OUT_DIR/daily.json  (기본 OUT_DIR = ../public/data)
+// 산출물: $OUT_DIR/status.json · live.json(오늘 출발편 지연·게이트) · daily.json  (기본 OUT_DIR = ../public/data)
 //
 // 안전 규칙 (CLAUDE.md 보수적 계산 · 정직성)
 //  - 항목 단위로 실패를 격리한다. 하나를 못 읽으면 그 항목만 이전 값을 유지한다.
@@ -19,6 +19,10 @@
 //  - flight-schedule/dom|int: schDate, schDeptCityCode. numOfRows 상한 100 (300 은 HTTP_ERROR).
 //  - 인천 passgrAnncmt: selectdate=0(오늘)/1(내일). adate="합계" 행이 섞여 있다.
 //  - 미신청 API 는 JSON 으로 returnReasonCode 30 을 준다.
+//  - 인천 출국장 혼잡도: 운영이 끝난 출국장도 waitTime 이 그대로(6 등) 찍혀 나온다. operatingTime("06:00~19:00", 미운영은 "")
+//    으로 걸러야 한다 — 거르는 일은 앱이 한다("지금"이 언제인지는 앱만 안다).
+//  - flight-status/info: schAirCode=GMP, schIOType=O(출발), schFln=KE1007 필터가 된다. 오늘 것만 준다(schDate 는 무시된다).
+//    편명에 접미 문자가 붙기도 한다(ZE781A).
 import { readFile, writeFile, mkdir, appendFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 
@@ -244,7 +248,9 @@ async function parking() {
   for (const it of kac ?? []) {
     const code = Object.entries(NAME2CODE).find(([k]) => String(it.airportKor ?? "").includes(k))?.[1];
     const total = num(it.parkingTotalSpace), used = num(it.parkingOccupiedSpace);
+    const lotName = String(it.parkingAirportCodeName ?? "");
     if (!code || !total) continue;
+    if (lotName.includes("화물") && !lotName.includes("여객")) continue; // 화물청사·화물주차장은 여객용이 아니다
     (out[code] ??= []).push({ name: String(it.parkingAirportCodeName ?? "").trim(), used, total });
   }
   return Object.keys(out).length ? out : null;
@@ -265,9 +271,41 @@ async function logHistory(live) {
   } catch (e) { note(`history 기록 실패: ${e.message}`); }
 }
 
+/**
+ * 오늘 출발편의 지연·결항·게이트. 행 = [편명, 공항, 예정HHMM, 변경HHMM|null, 게이트|null, 상태, D|I, 터미널|null, 체크인카운터|null]
+ * 인천(15112968)은 활용신청이 반영되면 붙는다 — 필드는 포털 명세 기준이며 첫 성공 시 확인할 것.
+ */
+async function liveFlights() {
+  const rows = [];
+  for (const ap of KAC_AIRPORTS) {
+    const list = await attempt(`실시간 운항 ${ap}`, () =>
+      fetchAll(`${KAC}/flight-status/info`, { schAirCode: ap, schIOType: "O" }, { where: "flight-status" }), null);
+    for (const it of list ?? []) {
+      if (it.airport !== ap || it.io !== "O") continue;
+      const no = String(it.airFln ?? "").trim().toUpperCase();
+      const std = hhmm(it.std);
+      if (!no || !std) continue;
+      rows.push([no, ap, std, it.etd ? hhmm(it.etd) : null, it.gate ? String(it.gate).trim() : null,
+        String(it.rmkKor ?? "").trim() || null, it.line === "국제" ? "I" : "D", null, null]);
+    }
+  }
+  const today = ymd(kstDay(0));
+  const icn = await attempt("인천 실시간 운항", () =>
+    fetchAll(`${IIA}/StatusOfPassengerFlightsDeOdp/getPassengerDeparturesDeOdp`, {}, { where: "icn-flight-status" }), null);
+  for (const it of icn ?? []) {
+    const sch = String(it.scheduleDateTime ?? ""), est = String(it.estimatedDateTime ?? "");
+    if (sch.slice(0, 8) !== today) continue;
+    const term = { P01: "T1", P02: "T1C", P03: "T2" }[it.terminalid] ?? null; // P02 = 탑승동
+    rows.push([String(it.flightId ?? "").trim().toUpperCase(), "ICN", sch.slice(8, 12), est.length >= 12 ? est.slice(8, 12) : null,
+      it.gatenumber ? String(it.gatenumber).trim() : null, String(it.remark ?? "").trim() || null,
+      it.typeOfFlight === "D" ? "D" : "I", term, it.chkinrange ? String(it.chkinrange).trim() : null]);
+  }
+  return rows.length ? { date: today, rows } : null;
+}
+
 async function runStatus() {
   const prev = (await readPrev("status.json")) ?? {};
-  const [live, kfc, ifc, gates, park] = await Promise.all([kacLive(), kacForecast(), icnForecast(), icnGates(), parking()]);
+  const [live, kfc, ifc, gates, park, flightsNow] = await Promise.all([kacLive(), kacForecast(), icnForecast(), icnGates(), parking(), liveFlights()]);
   if (!live && !kfc && !ifc && !park) {
     console.error("status: 전부 실패했다. 이전 데이터를 유지하고 종료한다.");
     process.exit(1);
@@ -283,8 +321,13 @@ async function runStatus() {
     problems: problems.length ? [...problems] : undefined
   };
   await writeOut("status.json", out);
+  // 운항 현황은 낡으면 해롭다 — 못 읽었으면 빈 목록으로 덮어 "정보 없음"이 되게 한다
+  await writeOut("live.json", {
+    v: 2, updatedAt: out.updatedAt, date: flightsNow?.date ?? ymd(kstDay(0)),
+    cols: ["no", "ap", "std", "etd", "gate", "rmk", "line", "term", "chkin"], rows: flightsNow?.rows ?? []
+  });
   if (live && process.env.LOG_HISTORY === "1") await logHistory(live); // 데이터 레포에서만 켠다 — 앱 번들에 CSV 가 섞이면 안 된다
-  console.log(`status 저장: 실측 ${Object.keys(out.kac).length}곳 · 예보 ${Object.keys(out.forecast).length}곳 · 출국장실측 ${gates ? "있음" : "없음"} · 주차 ${Object.keys(out.parking).length}곳`);
+  console.log(`status 저장: 운항 ${flightsNow?.rows.length ?? 0}편 · 실측 ${Object.keys(out.kac).length}곳 · 예보 ${Object.keys(out.forecast).length}곳 · 출국장실측 ${gates ? "있음" : "없음"} · 주차 ${Object.keys(out.parking).length}곳`);
 }
 
 /* =================================================================== daily */
