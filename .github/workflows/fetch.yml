@@ -5,8 +5,8 @@
 # 필요한 시크릿: DATA_GO_KR_KEY (공공데이터포털 일반 인증키)
 name: fetch
 on:
-  schedule:
-    - cron: "7,37 * * * *" # 정각·30분은 GitHub 스케줄러가 붐벼 밀린다
+  # schedule 제거(2026-09-19): GitHub 러너(미국)에서는 apis.data.go.kr 에 TCP 연결이 안 된다(실측).
+  # 배치는 한국 IP 의 호스트에서 run-batch.sh 로 돈다. 이 워크플로는 수동 실행용으로만 남긴다.
   workflow_dispatch:
 concurrency: data-writer # daily 와 같은 그룹 — 두 잡이 동시에 push 하지 않게
 permissions:

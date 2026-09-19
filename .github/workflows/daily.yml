@@ -3,8 +3,8 @@
 # 호출 수 약 250회 · 1분 남짓. 초당 호출 제한이 있어 스크립트가 220ms 간격으로 줄을 세운다.
 name: daily
 on:
-  schedule:
-    - cron: "10 19 * * *" # 04:10 KST
+  # schedule 제거(2026-09-19): GitHub 러너(미국)에서는 apis.data.go.kr 에 TCP 연결이 안 된다(실측).
+  # 배치는 한국 IP 의 호스트에서 run-batch.sh 로 돈다. 이 워크플로는 수동 실행용으로만 남긴다.
   workflow_dispatch:
 concurrency: data-writer
 permissions:
