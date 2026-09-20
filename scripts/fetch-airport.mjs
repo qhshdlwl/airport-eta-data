@@ -4,7 +4,8 @@
 //   node --env-file-if-exists=.env scripts/fetch-airport.mjs daily    # 하루 1회 — 운항 스케줄·요일 프로파일
 //   node --env-file-if-exists=.env scripts/fetch-airport.mjs all
 //
-// 산출물: $OUT_DIR/status.json · live.json(오늘 출발편 지연·게이트) · daily.json  (기본 OUT_DIR = ../public/data)
+// 산출물: $OUT_DIR/status.json · live.json(오늘 출발편 지연·게이트) · daily.json  (기본 OUT_DIR = ../src/data)
+//   앱은 status/daily 를 import 로 번들에 넣는다 — 첫 로딩에 네트워크 요청이 0이어야 한다(검수 3회 반려).
 //
 // 안전 규칙 (CLAUDE.md 보수적 계산 · 정직성)
 //  - 항목 단위로 실패를 격리한다. 하나를 못 읽으면 그 항목만 이전 값을 유지한다.
@@ -29,7 +30,7 @@ import { pathToFileURL } from "node:url";
 const MODE = process.argv[2] ?? "status";
 const OUT_DIR = process.env.OUT_DIR
   ? pathToFileURL(process.env.OUT_DIR.replace(/\/?$/, "/"))
-  : new URL("../public/data/", import.meta.url);
+  : new URL("../src/data/", import.meta.url);
 const KEY = process.env.DATA_GO_KR_KEY;
 const KAC = "https://apis.data.go.kr/B551178"; // 한국공항공사
 const IIA = "https://apis.data.go.kr/B551177"; // 인천국제공항공사
@@ -455,24 +456,44 @@ async function icnTerminals() {
   return Object.keys(out).length ? out : null;
 }
 
+/**
+ * 편명 스케줄을 사전 + 한 줄 문자열로 압축한다(v3).
+ * 291KB → 약 80KB. 번들이 클수록 최초 접속이 느려지고, 2026-09-20 검수가 "최초 접속 20초 초과"로
+ * 두 번 반려됐다. 통과한 앱들(seoul-block 47KB · danpung-map 62KB)과 같은 체급으로 맞춘다.
+ * 행: 편명,공항idx,노선(0=국내/1=국제),HHMM,운항기간idx,요일idx,도착지idx,항공사idx  — ';' 로 이음
+ */
+function encodeFlights(list) {
+  const ap = [], dest = [], airline = [], period = [], days = [];
+  const idx = (arr, v) => { const i = arr.indexOf(v); return i >= 0 ? i : arr.push(v) - 1; };
+  const safe = (s) => String(s ?? "").replace(/[,;]/g, " ").trim(); // 구분자가 값에 들어가면 안 된다
+  const rows = list.map((r) => [
+    safe(r[0]), idx(ap, safe(r[1])), r[2] === "I" ? 1 : 0, safe(r[3]),
+    idx(period, `${safe(r[4])}:${safe(r[5])}`), idx(days, safe(r[6])), idx(dest, safe(r[7])), idx(airline, safe(r[8]))
+  ].join(","));
+  return { ap, dest, airline, period, days, flights: rows.join(";") };
+}
+
 async function runDaily() {
   const prev = (await readPrev("daily.json")) ?? {};
   const list = await schedules();
   const prof = await weekdayProfile();
   const terms = await icnTerminals();
   // 스케줄이 비정상적으로 줄었으면 덮지 않는다 (부분 실패로 편명이 사라지는 것을 막는다)
-  const prevN = prev.flights?.length ?? 0;
+  const prevN = typeof prev.flights === "string" ? prev.flights.split(";").length : (prev.flights?.length ?? 0);
   const keepPrev = prevN > 0 && list.length < Math.max(200, prevN * 0.6);
   if (keepPrev) note(`스케줄이 ${list.length}건뿐이라(이전 ${prevN}건) 이전 목록을 유지한다`);
   if (!list.length && !prevN && !prof) {
     console.error("daily: 전부 실패했다. 이전 데이터를 유지하고 종료한다.");
     process.exit(1);
   }
+  const packed = keepPrev && prev.v === 3
+    ? { ap: prev.ap, dest: prev.dest, airline: prev.airline, period: prev.period, days: prev.days, flights: prev.flights }
+    : encodeFlights(list);
   const out = {
-    v: 2,
+    v: 3,
     updatedAt: new Date().toISOString(),
-    flightCols: ["no", "ap", "line", "time", "from", "to", "days(일~토)", "dest", "airline"],
-    flights: keepPrev ? prev.flights : list,
+    note: "flights 는 ';' 로 이은 행 문자열이다. 행 = 편명,공항idx,노선(0국내/1국제),HHMM,운항기간idx,요일idx,도착지idx,항공사idx",
+    ...packed,
     profile: prof?.profile ?? prev.profile ?? {},
     ref: prof?.ref ?? prev.ref ?? {},
     profileDays: prof?.days ?? prev.profileDays ?? 0,
@@ -480,7 +501,8 @@ async function runDaily() {
     problems: problems.length ? [...problems] : undefined
   };
   await writeOut("daily.json", out);
-  console.log(`daily 저장: 스케줄 ${out.flights.length}건 · 프로파일 ${Object.keys(out.profile).length}곳(${out.profileDays}일치) · 인천 터미널 ${Object.keys(out.icnTerminals).length}개 항공사`);
+  const n = packed.flights ? packed.flights.split(";").length : 0;
+  console.log(`daily 저장: 스케줄 ${n}건 · 프로파일 ${Object.keys(out.profile).length}곳(${out.profileDays}일치) · 인천 터미널 ${Object.keys(out.icnTerminals).length}개 항공사`);
 }
 
 /* ==================================================================== main */
